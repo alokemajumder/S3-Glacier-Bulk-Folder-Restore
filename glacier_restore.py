@@ -37,12 +37,10 @@ or set a lifecycle rule after restoration.
 # 4. Storage Classes:
 #    We check for "GLACIER", "DEEP_ARCHIVE", or "GLACIER_IR". Objects in other classes are skipped.
 
-# S3 Glacier Bulk Folder Restore (Temporary Access) with Skip List + Dry Run
-# ADDED support for a skip list of folder names and certain files.
-
-# Adds:
-# - Skip list file support (folders + filenames)
-#  - Dry run mode (no restore calls)
+# 5. S3 Glacier Bulk Folder Restore (Temporary Access) with Skip List + Dry Run
+#    ADDED support for a skip list of folder names and certain files.
+#    Skip list file support (folders + filenames)
+#    Dry run mode (no restore calls)
 
 import sys
 import boto3
@@ -82,8 +80,6 @@ def should_skip_key(key, skip_items):
 
     return False
 
-
-
 # -------------------------------
 # Restore logic
 # -------------------------------
@@ -100,21 +96,49 @@ def restore_folder(bucket_name, prefix, restore_days=30,
                 return
 
     """
+    Recursively restores all Glacier/Deep Archive objects under the given prefix in an S3 bucket
+    using the Bulk retrieval tier (cheapest option). The restored copy remains in S3 Standard
+    for 'restore_days' days, then expires automatically.
+
+    Parameters
+    ----------
+    bucket_name : str
+        The name of the S3 bucket to restore from.
+    prefix : str
+        The folder prefix (e.g., 'my-folder/') to restore recursively.
+    restore_days : int, optional
+        Number of days to keep the restored data in S3 Standard (default 30).
+    aws_access_key_id : str, optional
+        AWS Access Key ID if you want to override the default AWS credential chain.
+    aws_secret_access_key : str, optional
+        AWS Secret Access Key if you want to override the default AWS credential chain.
+    Returns
+    -------
+    None
+    
+    Prints status messages and summary of the restore operation.
     Recursively restores all Glacier/Deep Archive objects under the given prefix.
-    Supports skip list and dry run mode.
+    
+    Edits:
+    16-05-2026 - R.tucker.  Added support for a skip list text file (list of folders to ignore and files to skip)
+    Also added an option for a dry run mode which will only print what wll be changed based on skiplist if configured.
     """
 
+    # Hardcode the retrieval tier to "Bulk" for cost minimization
     retrieval_tier = "Bulk"
 
+    # Create the S3 client. If credentials are not provided, fallback to the default chain
     s3_client = boto3.client(
         "s3",
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key
     )
 
+    # Use the paginator to list all objects matching the prefix
     paginator = s3_client.get_paginator("list_objects_v2")
     page_iterator = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
 
+    # Track counters for various outcomes
     restored_count = 0
     already_in_progress_count = 0
     not_glacier_count = 0
@@ -122,13 +146,16 @@ def restore_folder(bucket_name, prefix, restore_days=30,
     error_count = 0
 
     for page in page_iterator:
+        # If there's no "Contents" in this page, skip
         if "Contents" not in page:
             continue
 
+        # Go through each object in the current page
         for obj in page["Contents"]:
             key = obj["Key"]
+            # If StorageClass not present, assume 'STANDARD'
             storage_class = obj.get("StorageClass", "STANDARD")
-            restore_status = obj.get("Restore")
+            restore_status = obj.get("Restore")  # 'None' if not being restored / no restore has happened
 
             # Skip unwanted folders/files
             if skip_items and should_skip_key(key, skip_items):
@@ -136,8 +163,9 @@ def restore_folder(bucket_name, prefix, restore_days=30,
                 skipped_filter_count += 1
                 continue
 
-            # Only restore Glacier/Deep Archive
+            # Only attempt to restore if object is in Glacier / Deep Archive / Glacier IR
             if storage_class not in ["GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"]:
+                # If there's no active or completed restore
                 if not dry_run:
                     print(f"[SKIPPED] {key} is not in Glacier/Deep Archive (StorageClass: {storage_class}).")
                 not_glacier_count += 1
@@ -158,6 +186,7 @@ def restore_folder(bucket_name, prefix, restore_days=30,
 
             # REAL RESTORE CALL
             try:
+                # Initiate the restore request
                 s3_client.restore_object(
                     Bucket=bucket_name,
                     Key=key,
@@ -175,7 +204,7 @@ def restore_folder(bucket_name, prefix, restore_days=30,
                 error_count += 1
                 print(f"[ERROR] Failed to restore {key}: {e}")
 
-    # Summary
+    # Print a summary of the operation
     print("\n--- Restore Summary ---")
     print(f"Total restore actions (or dry-run actions): {restored_count}")
     print(f"Already in progress/restored: {already_in_progress_count}")
@@ -189,17 +218,29 @@ def restore_folder(bucket_name, prefix, restore_days=30,
 # -------------------------------
 
 def main():
+    """
+    Prompts the user for S3 bucket name, prefix, restore days, and optional credentials,
+    then runs the restore_folder function to initiate Bulk-tier temporary restores.
+    """
     print("=== S3 Glacier TEMPORARY Bulk Restore Script (with Skip List + Dry Run) ===")
 
+    # Collect user inputs
     bucket_name = input("Enter S3 bucket name: ").strip()
     prefix = input("Enter folder prefix (e.g., 'my-folder/'): ").strip()
 
-    restore_days_input = input("Enter number of days to keep restored copy (default 30): ").strip()
+    # Ask for how many days the temporary restore should remain
+    restore_days_input = input("Enter number of days to keep the restored copy (default 30): ").strip()
     restore_days = int(restore_days_input) if restore_days_input else 30
 
     print("\nIf left blank, default AWS credential chain will be used.")
     aws_access_key_id = input("Enter AWS Access Key ID (or leave blank): ").strip() or None
     aws_secret_access_key = input("Enter AWS Secret Access Key (or leave blank): ").strip() or None
+
+    # Convert empty strings to None for Boto3
+    if not aws_access_key_id:
+        aws_access_key_id = None
+    if not aws_secret_access_key:
+        aws_secret_access_key = None
 
     # Skip list file
     skip_file = input("Enter path to skip-list file (or leave blank): ").strip()
@@ -222,7 +263,7 @@ def main():
         print(f"[ERROR] Could not access bucket '{bucket_name}': {e}")
         sys.exit(1)
 
-    # Show sample objects
+    # Show a small sample of objects under the prefix
     print("\nChecking objects under prefix...\n")
     paginator = s3_client.get_paginator("list_objects_v2")
     page_iterator = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
@@ -247,20 +288,29 @@ def main():
         for i, key in enumerate(sample_objects, start=1):
             print(f"  {i}. {key}")
 
-    # Confirm
+    # Display the final configuration for confirmation
     print("\n--- Configuration ---")
     print(f"Bucket: {bucket_name}")
     print(f"Prefix: {prefix}")
-    print(f"Restore Days: {restore_days}")
+    print("Retrieval Tier: Bulk (Forced, to minimize cost)")
+    print(f"Restore Days (TEMPORARY): {restore_days}")
     print(f"Skip items: {skip_items if skip_items else 'None'}")
     print(f"Dry run: {dry_run}")
 
+    if aws_access_key_id and aws_secret_access_key:
+        print(f"AWS Access Key ID: {aws_access_key_id}")
+        print(f"AWS Secret Access Key: {'*' * len(aws_secret_access_key)}")
+    else:
+        print("No explicit AWS credentials provided; using default credential chain.")
+
+    # Final user confirmation
     proceed = input("\nProceed with restore? (y/N): ").strip().lower()
     if proceed != "y":
         print("Exiting without restoring.")
         sys.exit(0)
 
-    print("\nStarting restore process...\n")
+    # Initiate the restore
+    print("\nStarting temporary Bulk restore process...\n")
     restore_folder(
         bucket_name=bucket_name,
         prefix=prefix,
