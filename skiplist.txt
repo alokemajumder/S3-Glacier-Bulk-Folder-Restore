@@ -1,0 +1,4 @@
+.@__thumb
+.DS_Store
+picasa.ini
+Thumbs.db
