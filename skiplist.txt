@@ -1,4 +1,32 @@
-.@__thumb
+# Exclude patterns for s3-glacier-restore (--skip-file).
+#
+# One shell-style glob per line. '#' starts a comment.
+#   * matches within a path segment      ? matches one character
+#   ** crosses '/' boundaries            trailing '/' means "this dir and below"
+#
+# A pattern with no '/' matches the filename OR any directory component,
+# at any depth. A pattern containing '/' matches the whole key.
+#
+# Note: before v2.0 these were substring matches, so "raw" also excluded
+# "brawl/". Matching is now glob-based; add '*' where you relied on that.
+
+# macOS
 .DS_Store
-picasa.ini
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# Windows
 Thumbs.db
+desktop.ini
+$RECYCLE.BIN
+
+# NAS thumbnail and index directories
+.@__thumb
+@eaDir
+.@upload_cache
+
+# Photo manager sidecars
+picasa.ini
+.picasa.ini

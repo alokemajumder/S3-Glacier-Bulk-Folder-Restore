@@ -66,14 +66,56 @@ Thank you for your interest in contributing to this project! We value all types 
 
 ---
 
+## Development setup
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
 ## Testing
 
-While this project may not have a formal test suite, it’s good practice to:
+The suite runs entirely offline -- no AWS account, no network, no credentials.
 
-1. Test your changes locally by running the script and confirming it behaves as intended.
-2. If possible, add or update any automated tests or scripts that help validate behavior.
+```bash
+pytest                                          # all tests
+pytest --cov=s3_glacier_restore --cov-report=term-missing
+pytest tests/test_engine.py -k intelligent -v   # one area
+```
 
----
+Two layers, and new code should land in both where relevant:
+
+- `tests/conftest.py` provides `FakeS3`, an in-memory client with realistic
+  pagination. Use it for behaviour: which objects get restored, what the
+  counters say, how errors are classified.
+- `tests/test_integration.py` drives a **real** boto3 client through
+  botocore's `Stubber`, which validates every request against the actual S3
+  service model. Anything that changes the shape of an API call belongs here
+  too -- it is the only layer that catches a misspelled parameter.
+
+Please add a regression test for each bug fix, and name it after the behaviour
+rather than the function (`test_glacier_ir_is_not_restorable`, not
+`test_classify_3`).
+
+## Linting and formatting
+
+CI runs both, so run them before pushing:
+
+```bash
+ruff check .          # add --fix to apply what it can
+ruff format .
+```
+
+## Things worth knowing before changing the engine
+
+- **Every object costs money.** A bug that issues a redundant `RestoreObject`
+  is a billing bug, not just a correctness one. When in doubt, skip and count.
+- **Never let a worker raise.** `RestoreEngine._process` must always return an
+  outcome; one uncaught exception should not end a six-hour run.
+- **Keep it streaming.** Nothing should accumulate per-object state that grows
+  with bucket size. Assume fifty million keys.
+- **`--dry-run` must stay honest.** It runs the same classification path as a
+  live run; the only difference is the final call.
 
 ## License
 
