@@ -1,155 +1,298 @@
-# S3 Glacier Bulk Folder Restore (Temporary Access)
+# S3 Glacier Bulk Folder Restore
 
-A Python script to **recursively** restore **all** objects stored in Amazon S3 Glacier or Deep Archive under a given prefix (folder). This is particularly helpful when you have **large numbers** of Glacier or Deep Archive objects that would otherwise require individual manual restores in the AWS Console.
+[![CI](https://github.com/alokemajumder/S3-Glacier-Bulk-Folder-Restore/actions/workflows/ci.yml/badge.svg)](https://github.com/alokemajumder/S3-Glacier-Bulk-Folder-Restore/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-## Problem Statement
+Recursively restore **every archived object under an S3 prefix** — Glacier
+Flexible Retrieval, Glacier Deep Archive, and (optionally) Intelligent-Tiering
+archive tiers — with one command.
 
-By default, the AWS Console forces you to **restore each file individually**, which is impractical if you have thousands (or millions) of archived objects. This script solves that problem by **automating** the restore process:
+The AWS Console makes you restore objects one at a time. That is fine for ten
+objects and impossible for ten million. This tool walks the prefix, works out
+which objects actually need a restore, and issues the requests concurrently,
+resumably, and with a dry run you can trust.
 
-1. **Recursively** scans all subfolders under a specified prefix.
-2. **Forces** the restore tier to **Bulk** to minimize costs (though it can be slower than Standard or Expedited).
-3. Creates a **temporary** copy in S3 Standard for a chosen number of days (`restore_days`), after which the copy expires and you cease paying S3 Standard rates.
+```bash
+# Preview: what would be restored, and how much data is involved?
+s3-glacier-restore --bucket my-archive --prefix backups/2019/ --dry-run
+
+# Do it: 7-day restore, 32 in parallel, resumable, logged
+s3-glacier-restore --bucket my-archive --prefix backups/2019/ \
+    --days 7 --concurrency 32 --state-file restore.state --log-file restore.log --yes
+```
 
 ---
 
-## Disclaimer
+## Why not just loop over `aws s3api restore-object`?
 
-- **Use at your own risk.**  
-- Always review your AWS costs and your account limits before running large-scale bulk restores.  
-- This code is provided as-is without any warranties.  
+A naive loop gets four things wrong, and all four cost money:
+
+| | Naive loop | This tool |
+|---|---|---|
+| **Objects already restoring** | Re-requests them; you pay twice | Detected from `RestoreStatus` and skipped |
+| **`GLACIER_IR` objects** | `InvalidObjectState` error each | Recognised as already readable |
+| **Throttling at scale** | 3 retries, then failures | Adaptive retry with client-side rate limiting |
+| **A crash at 90%** | Start over, pay again | `--state-file` resumes where it stopped |
+
+Plus: one request at a time is roughly 5½ hours per million objects. At
+`--concurrency 32` that is closer to 10 minutes.
 
 ---
 
 ## Features
 
-- **Recursive** restore: Lists and restores **all** objects in Glacier/Deep Archive under a given prefix.  
-- **User Prompts**:  
-  - Checks bucket accessibility,  
-  - Shows a sample of objects in that prefix,  
-  - Asks for final confirmation before initiating the restore.  
-- **Temporary Restore**: By default, the restored copy remains in S3 Standard for 30 days (configurable).  
-- **Default Credential Chain**: If no credentials are provided, it falls back to environment variables, AWS CLI, or instance roles.
+- **Recursive and streaming.** Walks any prefix, including all subfolders.
+  Objects are processed as they page in, so memory stays flat whether the
+  prefix holds a thousand keys or fifty million.
+- **Concurrent.** Tunable parallelism with an HTTP connection pool sized to
+  match and adaptive retries tuned for S3's throttling behaviour.
+- **Resumable.** `--state-file` records each initiated restore; re-running the
+  same command picks up exactly where it left off.
+- **Honest dry run.** `--dry-run` performs the full classification pass — same
+  filters, same storage-class checks — and issues zero restore calls.
+- **Correct storage-class handling.** Glacier and Deep Archive are restored;
+  `GLACIER_IR` is recognised as instantly readable; Intelligent-Tiering is
+  checked for an archive tier only when you ask.
+- **Glob filtering.** `--exclude`, `--include`, and a `--skip-file` of
+  patterns, so you never pay to retrieve `.DS_Store` and `Thumbs.db`.
+- **Versioned buckets.** `--versions` restores non-current versions too.
+- **Batch Operations manifest.** `--manifest-out` emits a CSV manifest for S3
+  Batch Operations, which is the right tool past a few million objects.
+- **Scriptable.** Every prompt has a flag; meaningful exit codes; structured
+  logging to a file; graceful Ctrl-C.
+- **Safe by default.** Bulk (cheapest) tier, confirmation before anything
+  billable, and it refuses to start a live run unattended without `--yes`.
 
 ---
 
-## Prerequisites
+## Install
 
-- **Python 3.7+**  
-- **[Boto3](https://pypi.org/project/boto3/)** installed:
-  ```bash
-  pip install boto3
+Requires Python 3.9 or newer (boto3 recommends 3.10+).
 
--   AWS Credentials with permissions:
-    -   `s3:ListBucket` (to list objects under a prefix),
-    -   `s3:RestoreObject` (to initiate restore),
-    -   (Optionally) `s3:GetObject` if you plan to download them after restore.
+```bash
+git clone https://github.com/alokemajumder/S3-Glacier-Bulk-Folder-Restore.git
+cd S3-Glacier-Bulk-Folder-Restore
 
-----------
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install .
+```
 
-## Installation & Setup
+That installs the `s3-glacier-restore` command. Without installing, either of
+these works from the repo directory:
 
-1.  **Clone** or download this repository:
-    
-    `git clone https://github.com/alokemajumder/S3-Glacier-Bulk-Folder-Restore.git
-    cd S3-Glacier-Bulk-Folder-Restore` 
-    
-2.  (Optional) **Create a virtual environment**:
-    
-    `python -m venv venv
-    source venv/bin/activate
-    # On Windows: venv\Scripts\activate` 
-    
-3.  **Install dependencies**:
-   
-    
-    `pip install boto3` 
-    
+```bash
+pip install -r requirements.txt
+python -m s3_glacier_restore --help
+python glacier_restore.py --help      # original entry point, still supported
+```
 
-----------
+### Credentials
+
+Any source the AWS SDK understands: `aws configure`, `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY`, `--profile`, SSO, or an EC2/ECS/Lambda role. The
+minimum IAM policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::my-archive"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:RestoreObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::my-archive/*"
+    }
+  ]
+}
+```
+
+`s3:ListBucketVersions` is only needed for `--versions`; `s3:GetObject` only
+for `--include-intelligent-tiering` (which calls `HeadObject`) and for
+downloading afterwards.
+
+Passing keys on the command line is supported but discouraged — they land in
+your shell history and in `ps` output. Use `--secret-access-key -` to be
+prompted without echo.
+
+---
 
 ## Usage
 
-1.  **Run** the script:
-    
-    `python glacier_restore.py` 
-    
-2.  **Follow** the prompts:
-    
-    -   **Bucket Name**: e.g. `my-archive-bucket`
-    -   **Prefix**: e.g. `folder-to-restore/`  
-        The script **recursively** handles all objects under this prefix (including subfolders).
-    -   **Number of days** to keep the restored copy (default is 30).
-    -   **AWS Credentials** (optional). If you leave them blank, it uses your default AWS credential chain.
-3.  **Confirm** when prompted. The script displays:
-    
-    -   A sample of objects under the prefix (up to 5 keys).
-    -   Total objects found so far under that prefix.
-    -   Bulk restore tier, to save costs.
-4.  After you confirm (`y`), the script:
-    
-    -   Initiates **Bulk** restore requests for **all** Glacier/Deep Archive objects under the prefix.
-    -   Skips objects that are already restored or not in Glacier classes.
-    -   Displays a final summary.
-5.  **Wait** for the restore to complete. Bulk restore can take hours, depending on the size and number of objects.
-    
+Three front ends, one engine: a **desktop window**, **guided prompts**, or
+**flags** for automation.
 
-> **Note**: The **temporary** copy in S3 Standard will expire after `restore_days`. If you need the data permanently in S3 Standard, you must copy it to another bucket/key or set a lifecycle rule to transition the storage class.
+### Desktop app
 
-----------
+For anyone who would rather not touch a terminal (issue #1):
 
-## Example
+```bash
+s3-glacier-restore-gui        # or: s3-glacier-restore --gui
+```
 
+The window has a bucket/prefix form, a **Check bucket** button that verifies
+access and previews the first 25 objects with their storage classes, a live
+activity log you can save to a file, and **Stop** to halt a run in progress.
+Dry run is ticked by default, and a live restore asks for confirmation with
+the cost implications spelled out. Filters, credentials, and the resume state
+file live on the second tab.
 
-    `=== S3 Glacier TEMPORARY Bulk Restore Script ===
-    Enter S3 bucket name: my-bucket
-    Enter folder prefix (e.g., 'my-folder/'): backups/
-    Enter the number of days to keep the restored copy (default 30): 7
-    
-    If you leave the following blank, the default AWS credential chain will be used.
-    Enter AWS Access Key ID (or leave blank):
-    Enter AWS Secret Access Key (or leave blank):
-    
-    [OK] Bucket 'my-bucket' is accessible.
-    
-    Checking objects under the prefix...
-    
-    Found 8 object(s) under prefix 'backups/'. Showing up to 5 sample keys:
-      1. backups/2021/server1-data.gz
-      2. backups/2021/server2-data.gz
-      3. backups/2022/server1-archive.log
-      4. backups/2022/server2-archive.log
-      5. backups/2023/server3-archive.log
-    
-    --- Configuration ---
-    Bucket: my-bucket
-    Prefix: backups/
-    Retrieval Tier: Bulk (Forced to minimize cost)
-    Restore Days (TEMPORARY): 7
-    
-    Do you want to proceed with the TEMPORARY Bulk restore? (y/N): y
-    
-    Starting temporary Bulk restore process...
-    
-    [INITIATED] Bulk restore request started for: backups/2021/server1-data.gz
-    [INITIATED] Bulk restore request started for: backups/2021/server2-data.gz
-    ...
-    
-    --- Restore Summary ---
-    Total initiated restores: 8
-    Already in progress/restored: 0
-    Skipped (not Glacier/Deep Archive): 0
-    Errors: 0
-    
-    Restore process completed.` 
+Tkinter ships with most Python installations. If yours lacks it:
+`apt install python3-tk` on Debian/Ubuntu, `brew install python-tk` on macOS.
 
-----------
+### Command line
 
-## Contributing
+Run with no arguments for guided prompts, or drive it entirely with flags.
 
-Please see our [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to open issues, suggest changes, or submit pull requests.
+### The normal workflow
 
-----------
+```bash
+# 1. See what is there and what it would cost you to retrieve
+s3-glacier-restore -b my-archive -p photos/2019/ --dry-run
+
+# 2. Restore it, skipping filesystem junk, resumable
+s3-glacier-restore -b my-archive -p photos/2019/ \
+    --days 14 --skip-file skiplist.txt --state-file photos.state --yes
+
+# 3. Bulk restores take 5-12 hours (up to 48 for Deep Archive). Then:
+aws s3 cp --recursive s3://my-archive/photos/2019/ ./photos/
+```
+
+### Options that matter
+
+| Flag | Effect |
+|---|---|
+| `--dry-run` / `-n` | Full classification pass, zero restore calls |
+| `--days N` / `-d` | How long the restored copy stays available (default 30) |
+| `--tier` / `-t` | `Bulk` (default, cheapest), `Standard`, `Expedited` |
+| `--concurrency N` / `-c` | Parallel requests (default 16) |
+| `--state-file PATH` | Record progress; re-run to resume |
+| `--exclude GLOB` | Skip matching keys; repeatable |
+| `--include GLOB` | Restore *only* matching keys; repeatable |
+| `--skip-file PATH` | Read exclude patterns from a file |
+| `--versions` | Restore non-current object versions too |
+| `--include-intelligent-tiering` | Also restore archived Intelligent-Tiering objects |
+| `--max-objects N` | Stop after N restorable objects — a bounded first run |
+| `--manifest-out PATH` | Write a CSV manifest for S3 Batch Operations |
+| `--yes` / `-y` | Skip confirmation (required for unattended runs) |
+| `--log-file PATH` | Full debug log alongside the terse console output |
+
+`s3-glacier-restore --help` lists everything.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Completed; no failures |
+| `1` | Completed, but some objects failed |
+| `2` | Bad configuration or unusable credentials |
+| `3` | Aborted at the confirmation prompt |
+| `130` | Interrupted (Ctrl-C / SIGTERM) |
+
+---
+
+## Filter patterns
+
+Patterns are shell-style globs. A pattern **with** `/` matches the whole key;
+a pattern **without** `/` matches the filename *or* any directory component,
+at any depth.
+
+```
+.DS_Store       every file named .DS_Store, anywhere
+*.tmp           every file ending in .tmp
+@eaDir          everything inside a directory named @eaDir
+2023/           everything under any "2023/" directory
+logs/*.gz       logs/a.gz  (not logs/2024/a.gz — single * stops at '/')
+logs/**         everything under logs/, at any depth
+```
+
+`--exclude` always beats `--include`. `--ignore-case` applies to both.
+
+> **Changed in 2.0.** Patterns used to be substrings, which meant `raw` also
+> excluded `brawl/` and `2019` also excluded `12019-scan/`. Matching is now
+> glob-based. If you relied on the old behaviour, add wildcards: `*raw*`.
+
+The bundled `skiplist.txt` covers the usual macOS, Windows, and NAS clutter.
+
+---
+
+## Very large restores
+
+Direct `RestoreObject` calls scale to a few million objects comfortably. Past
+that, S3 Batch Operations is what AWS built for the job — it runs the restores
+server-side, retries for you, and writes a completion report:
+
+```bash
+# Produce the manifest without restoring anything
+s3-glacier-restore -b my-archive -p backups/ --dry-run --manifest-out manifest.csv
+
+# Upload it, then create a Batch Operations job with:
+#   Manifest format: S3BatchOperations_CSV_20180820
+#   Operation:       Restore
+```
+
+The manifest contains only objects that genuinely need a restore, after your
+filters — so you are not paying Batch Operations to re-examine keys this tool
+already ruled out.
+
+---
+
+## Costs and caveats
+
+- **Use at your own risk.** Bulk restores of large archives are billable and
+  hard to cancel. Run `--dry-run` first; it reports the object count and total
+  bytes before you commit.
+- Retrieval is billed **per GB and per request**, and the restored copy is
+  billed at **S3 Standard rates for `--days` days** *on top of* the archive
+  storage you are still paying for. See
+  [S3 pricing](https://aws.amazon.com/s3/pricing/) — rates vary by region.
+- The restore is **temporary**. After `--days`, the copy expires and the
+  object is archive-only again. To keep the data, copy it elsewhere or apply a
+  lifecycle rule before the copy expires.
+- Bulk retrievals typically complete in 5–12 hours; Deep Archive Bulk can take
+  up to 48 hours. This tool *initiates* restores — it does not wait for them.
+- `GLACIER_IR` (Instant Retrieval) objects need no restore and are skipped.
+
+---
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest                 # 195 tests, no AWS account or network needed
+ruff check . && ruff format --check .
+```
+
+Tests cover the engine against an in-memory S3 fake, and the request shapes
+against botocore's real S3 service model via `Stubber` — so a malformed
+parameter fails in CI rather than against your bucket. The GUI's logic layer
+(`GuiRunner`, `config_from_fields`) holds no Tkinter imports, so it is tested
+headlessly too.
+
+Layout:
+
+```
+s3_glacier_restore/
+  cli.py        argument parsing, prompts, confirmation, exit codes
+  gui.py        Tkinter window + a Tk-free GuiRunner/config layer
+  engine.py     classification, bounded concurrency, cancellation
+  lister.py     streaming pagination over objects and versions
+  filters.py    glob include/exclude matching
+  aws.py        session, region resolution, retry and pool tuning
+  state.py      append-only resume checkpoint
+  manifest.py   S3 Batch Operations CSV writer
+  config.py     RestoreConfig + validation
+  models.py     S3Object, Outcome, thread-safe Stats
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
+
+---
 
 ## License
 
-This project is open-sourced under the [MIT License](LICENSE). You’re free to use, modify, and distribute it as described in the license.
+MIT — see [LICENSE](LICENSE). Provided as-is, without warranty.
