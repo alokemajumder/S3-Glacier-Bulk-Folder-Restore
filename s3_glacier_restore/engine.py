@@ -23,6 +23,7 @@ import logging
 import threading
 import time
 from collections.abc import Iterable, Iterator
+from datetime import datetime, timezone
 from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -44,6 +45,21 @@ from .models import (
 from .state import NullState
 
 log = logging.getLogger(__name__)
+
+
+def still_available(expiry: datetime | None) -> bool:
+    """True when a restored copy exists *and* has not expired yet.
+
+    S3 is not guaranteed to drop ``RestoreExpiryDate`` the instant a temporary
+    copy lapses, so the date is compared against the clock rather than merely
+    checked for presence.
+    """
+    if expiry is None:
+        return False
+    if expiry.tzinfo is None:  # defensive: boto3 returns aware datetimes
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry > datetime.now(timezone.utc)
+
 
 # Error codes that mean "this object is fine, just not actionable".
 _BENIGN_ERRORS = {
@@ -176,13 +192,17 @@ class RestoreEngine:
         if obj.restore_in_progress:
             return Outcome.ALREADY_IN_PROGRESS, ""
 
-        if obj.restore_expiry is not None:
-            # A restored copy is already available; re-requesting it would only
-            # extend the expiry, which is rarely what a bulk run intends.
+        if still_available(obj.restore_expiry):
+            # A restored copy is available right now; re-requesting it would
+            # only extend the expiry, which is rarely what a bulk run intends.
             return (
                 Outcome.ALREADY_RESTORED,
                 f"available until {obj.restore_expiry:%Y-%m-%d %H:%M} UTC",
             )
+        # An expiry in the past means the temporary copy has already lapsed and
+        # the object is archived again. Treating that as "already restored"
+        # would silently refuse to restore an object the caller cannot read --
+        # the exact failure this tool exists to prevent. Fall through instead.
 
         if storage_class == "DEEP_ARCHIVE" and self.cfg.tier not in DEEP_ARCHIVE_TIERS:
             if not self._deep_archive_tier_warned:

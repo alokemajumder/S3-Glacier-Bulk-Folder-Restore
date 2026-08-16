@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import threading
 
-from s3_glacier_restore.state import NullState, StateFile
+import pytest
+
+from s3_glacier_restore.state import NullState, StateFile, StateScopeError
 
 
 def test_roundtrip(tmp_path):
@@ -110,3 +113,62 @@ def test_escaping_cannot_collide(tmp_path):
     reloaded.load()
     assert reloaded.contains("a\nb")
     assert not reloaded.contains("a\\nb")
+
+
+def test_state_file_records_its_bucket(tmp_path):
+    path = str(tmp_path / "scoped.state")
+    with StateFile(path, bucket="my-archive") as state:
+        state.record("a.bin")
+    with open(path, encoding="utf-8") as handle:
+        assert "# bucket: my-archive" in handle.read()
+
+
+def test_reusing_a_state_file_across_buckets_is_refused(tmp_path):
+    """Entries are bare keys, so cross-bucket reuse would mark objects as
+    restored that never were."""
+    path = str(tmp_path / "shared.state")
+    with StateFile(path, bucket="backups-prod") as state:
+        state.record("db/0.tar.gz")
+
+    other = StateFile(path, bucket="backups-dr")
+    with pytest.raises(StateScopeError) as exc:
+        other.load()
+    assert "backups-prod" in str(exc.value)
+    assert "backups-dr" in str(exc.value)
+
+
+def test_same_bucket_reload_is_fine(tmp_path):
+    path = str(tmp_path / "same.state")
+    with StateFile(path, bucket="arch") as state:
+        state.record("a.bin")
+    again = StateFile(path, bucket="arch")
+    assert again.load() == 1
+    assert again.contains("a.bin")
+
+
+def test_different_prefixes_share_a_state_file(tmp_path):
+    """Scoping is per bucket: keys from different prefixes cannot collide."""
+    path = str(tmp_path / "p.state")
+    with StateFile(path, bucket="arch") as state:
+        state.record("photos/2019/a.bin")
+    later = StateFile(path, bucket="arch")
+    later.load()
+    assert not later.contains("photos/2020/a.bin")
+
+
+def test_unscoped_legacy_file_is_accepted_with_a_warning(tmp_path, caplog):
+    """State files written by 2.0.0 have no bucket line."""
+    path = tmp_path / "legacy.state"
+    path.write_text("# s3-glacier-restore state file\na.bin\n", encoding="utf-8")
+    state = StateFile(str(path), bucket="arch")
+    with caplog.at_level(logging.WARNING, logger="s3_glacier_restore.state"):
+        assert state.load() == 1
+    assert "predates bucket scoping" in caplog.text
+    assert state.contains("a.bin")
+
+
+def test_no_bucket_supplied_skips_the_check(tmp_path):
+    path = str(tmp_path / "nb.state")
+    with StateFile(path, bucket="arch") as state:
+        state.record("a.bin")
+    assert StateFile(path).load() == 1  # library use without a bucket still works

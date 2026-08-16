@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "s3-glacier-bulk-folder-restore"
-version = "2.0.0"
+version = "2.0.1"
 description = "Recursively bulk-restore archived Amazon S3 objects (Glacier, Deep Archive, Intelligent-Tiering) under a prefix."
 readme = "README.md"
 license = { file = "LICENSE" }

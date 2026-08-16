@@ -37,7 +37,7 @@ from .lister import format_bytes, sample_objects
 from .logsetup import configure, emit
 from .manifest import ManifestWriter, NullManifest
 from .models import RETRIEVAL_TIERS
-from .state import NullState, StateFile
+from .state import NullState, StateFile, StateScopeError
 
 log = logging.getLogger(__name__)
 
@@ -416,9 +416,12 @@ def _install_signal_handler(stop: threading.Event) -> None:
             # Second Ctrl-C: the operator means it.
             raise KeyboardInterrupt
         stop.set()
+        # Requests already accepted by S3 keep running there regardless, so
+        # the useful guarantee is that the summary and state file end up
+        # accurate -- not that the process dies instantly.
         log.warning(
-            "Interrupt received. Finishing in-flight requests; press Ctrl-C "
-            "again to exit immediately."
+            "Interrupt received. No new requests will be sent; waiting for the "
+            "in-flight ones to land so the summary stays accurate."
         )
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -446,7 +449,7 @@ def run(cfg: RestoreConfig, assume_yes: bool = False) -> int:
         emit("Aborted. Nothing was restored.")
         return EXIT_ABORTED
 
-    state = StateFile(cfg.state_file) if cfg.state_file else NullState()
+    state = StateFile(cfg.state_file, bucket=cfg.bucket) if cfg.state_file else NullState()
     resumed = state.load()
     if resumed:
         log.info(
@@ -523,7 +526,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cfg = config_from_args(args)
         return run(cfg, assume_yes=args.yes)
 
-    except ConfigError as exc:
+    except (ConfigError, StateScopeError) as exc:
         log.error("%s", exc)
         return EXIT_CONFIG
     except AwsError as exc:

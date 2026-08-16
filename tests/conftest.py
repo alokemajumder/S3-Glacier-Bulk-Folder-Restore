@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from datetime import datetime, timezone
 from typing import Any
@@ -131,3 +132,28 @@ def cfg() -> RestoreConfig:
 @pytest.fixture
 def fake() -> FakeS3:
     return FakeS3()
+
+
+@pytest.fixture(autouse=True)
+def isolate_package_logging():
+    """Undo any logging setup a test performed.
+
+    ``cli.main()`` calls ``logsetup.configure()``, which attaches a handler
+    bound to the current ``sys.stderr`` and sets ``propagate = False``. Under
+    pytest that stream is replaced and closed per test, so without this the
+    next test to log would write to a closed file, and ``caplog`` would never
+    see the record.
+    """
+    logger = logging.getLogger("s3_glacier_restore")
+    handlers = logger.handlers[:]
+    level, propagate = logger.level, logger.propagate
+    try:
+        yield
+    finally:
+        for handler in logger.handlers[:]:
+            if handler not in handlers:
+                logger.removeHandler(handler)
+                handler.close()
+        logger.handlers[:] = handlers
+        logger.setLevel(level)
+        logger.propagate = propagate

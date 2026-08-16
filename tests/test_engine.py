@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -77,10 +77,47 @@ def test_in_progress_restore_is_not_reissued():
 
 
 def test_already_restored_object_is_left_alone():
-    expiry = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    """A copy that is still available should not be re-requested."""
+    expiry = datetime.now(timezone.utc) + timedelta(days=3)
     fake, stats = run([obj("a.bin", "GLACIER", restore_expiry=expiry)])
     assert fake.restored_keys == []
     assert stats.get(Outcome.ALREADY_RESTORED) == 1
+
+
+@pytest.mark.parametrize("age", [timedelta(seconds=1), timedelta(days=1), timedelta(days=365)])
+def test_expired_restore_is_requested_again(age):
+    """The temporary copy has lapsed, so the object is archived again.
+
+    Treating a past RestoreExpiryDate as "already restored" would silently
+    refuse to restore an object the caller cannot read.
+    """
+    expiry = datetime.now(timezone.utc) - age
+    fake, stats = run([obj("a.bin", "GLACIER", restore_expiry=expiry)])
+    assert fake.restored_keys == ["a.bin"]
+    assert stats.get(Outcome.INITIATED) == 1
+    assert stats.get(Outcome.ALREADY_RESTORED) == 0
+
+
+def test_naive_expiry_is_treated_as_utc():
+    expiry = (datetime.now(timezone.utc) - timedelta(days=2)).replace(tzinfo=None)
+    fake, _ = run([obj("a.bin", "GLACIER", restore_expiry=expiry)])
+    assert fake.restored_keys == ["a.bin"]
+
+
+def test_in_progress_wins_over_a_stale_expiry():
+    """A fresh restore already running must not be re-requested."""
+    fake, stats = run(
+        [
+            obj(
+                "a.bin",
+                "GLACIER",
+                restore_in_progress=True,
+                restore_expiry=datetime.now(timezone.utc) - timedelta(days=5),
+            )
+        ]
+    )
+    assert fake.restored_keys == []
+    assert stats.get(Outcome.ALREADY_IN_PROGRESS) == 1
 
 
 def test_lister_requests_restore_status_attribute():

@@ -214,7 +214,7 @@ class GuiRunner:
     def _restore(self, cfg: RestoreConfig) -> None:
         client = self._client_factory(cfg)
         key_filter = KeyFilter(cfg.excludes, cfg.includes, cfg.ignore_case)
-        state = StateFile(cfg.state_file) if cfg.state_file else NullState()
+        state = StateFile(cfg.state_file, bucket=cfg.bucket) if cfg.state_file else NullState()
         resumed = state.load()
         if resumed:
             self.events.put(("status", f"Resuming: {resumed:,} object(s) already done."))

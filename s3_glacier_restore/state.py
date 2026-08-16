@@ -7,6 +7,11 @@ goes, so a `kill -9` loses at most the last buffered line.
 
 Format: one record per line, ``key`` or ``key<TAB>versionId``. Plain text
 keeps it greppable and lets an operator hand-edit it.
+
+The file records which **bucket** it belongs to. Entries are bare keys, so
+pointing the same state file at a second bucket with a similar layout would
+silently mark never-restored objects as done; the recorded scope turns that
+into an explicit error instead.
 """
 
 from __future__ import annotations
@@ -18,13 +23,19 @@ import threading
 log = logging.getLogger(__name__)
 
 _HEADER = "# s3-glacier-restore state file: one restored object per line\n"
+_SCOPE = "# bucket: "
+
+
+class StateScopeError(RuntimeError):
+    """The state file belongs to a different bucket than the current run."""
 
 
 class StateFile:
     """Records objects whose restore has been successfully initiated."""
 
-    def __init__(self, path: str, flush_every: int = 100) -> None:
+    def __init__(self, path: str, bucket: str | None = None, flush_every: int = 100) -> None:
         self.path = os.path.expanduser(path)
+        self.bucket = bucket
         self.flush_every = max(1, flush_every)
         self._seen: set[str] = set()
         self._handle = None
@@ -32,15 +43,39 @@ class StateFile:
         self._since_flush = 0
 
     def load(self) -> int:
-        """Read any pre-existing entries. Returns how many were found."""
+        """Read any pre-existing entries. Returns how many were found.
+
+        Raises :class:`StateScopeError` if the file was written for a
+        different bucket.
+        """
         if not os.path.exists(self.path):
             return 0
+        recorded = None
         with open(self.path, encoding="utf-8") as handle:
             for line in handle:
                 entry = line.rstrip("\n")
+                if entry.startswith(_SCOPE):
+                    recorded = entry[len(_SCOPE) :].strip()
+                    continue
                 if not entry or entry.startswith("#"):
                     continue
                 self._seen.add(entry)
+
+        if recorded and self.bucket and recorded != self.bucket:
+            raise StateScopeError(
+                f"State file '{self.path}' belongs to bucket '{recorded}', but this "
+                f"run targets '{self.bucket}'. Its entries are bare keys, so reusing "
+                "it here would mark objects as restored that never were. Use a "
+                "separate state file per bucket."
+            )
+        if self._seen and not recorded:
+            # Written by 2.0.0, which did not record a scope.
+            log.warning(
+                "State file '%s' predates bucket scoping; assuming it belongs to "
+                "'%s'. Delete it if it was written for a different bucket.",
+                self.path,
+                self.bucket or "this bucket",
+            )
         return len(self._seen)
 
     def open(self) -> None:
@@ -51,6 +86,8 @@ class StateFile:
         self._handle = open(self.path, "a", encoding="utf-8")  # noqa: SIM115 - closed by close()/__exit__
         if is_new:
             self._handle.write(_HEADER)
+            if self.bucket:
+                self._handle.write(f"{_SCOPE}{self.bucket}\n")
 
     @staticmethod
     def _encode(state_id: str) -> str:
