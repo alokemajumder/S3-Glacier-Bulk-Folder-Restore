@@ -3,6 +3,32 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1]
+
+Found by an end-to-end audit against `moto`'s S3 implementation.
+
+### Fixed
+
+- **An expired restore was treated as an available one.** `_classify` skipped
+  any object carrying a `RestoreExpiryDate`, without checking whether that date
+  had passed. An object restored for 7 days last month, whose temporary copy
+  has since lapsed, was reported as *"Already restored and still available"* and
+  silently skipped with exit code 0 — the tool refusing to restore an object the
+  caller cannot read, which is the exact failure it exists to prevent. The
+  expiry is now compared against the clock, so a lapsed copy is requested again.
+  No user error was needed to trigger this.
+- **State files were not scoped to a bucket.** Entries are bare keys, so
+  pointing one state file at a second bucket with a similar layout (a `prod`
+  and a `dr` copy of the same backup set, say) silently marked never-restored
+  objects as done and exited 0. The file now records its bucket and refuses a
+  mismatched run with an explanation. Files written by 2.0.0 carry no scope and
+  are accepted with a warning.
+- The interrupt message promised that a second Ctrl-C would "exit immediately",
+  which the in-flight drain does not deliver. It now describes what actually
+  happens.
+- Test runs no longer leak logging handlers between tests, which had left a
+  handler writing to a closed stream and blocked `caplog`.
+
 ## [2.0.0]
 
 A rewrite of the single-file script into a tested package. The command-line

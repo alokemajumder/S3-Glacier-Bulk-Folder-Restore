@@ -48,7 +48,8 @@ Plus: one request at a time is roughly 5½ hours per million objects. At
 - **Concurrent.** Tunable parallelism with an HTTP connection pool sized to
   match and adaptive retries tuned for S3's throttling behaviour.
 - **Resumable.** `--state-file` records each initiated restore; re-running the
-  same command picks up exactly where it left off.
+  same command picks up exactly where it left off. The file is scoped to its
+  bucket, so it cannot be pointed at another one by mistake.
 - **Honest dry run.** `--dry-run` performs the full classification pass — same
   filters, same storage-class checks — and issues zero restore calls.
 - **Correct storage-class handling.** Glacier and Deep Archive are restored;
@@ -170,7 +171,7 @@ aws s3 cp --recursive s3://my-archive/photos/2019/ ./photos/
 | `--days N` / `-d` | How long the restored copy stays available (default 30) |
 | `--tier` / `-t` | `Bulk` (default, cheapest), `Standard`, `Expedited` |
 | `--concurrency N` / `-c` | Parallel requests (default 16) |
-| `--state-file PATH` | Record progress; re-run to resume |
+| `--state-file PATH` | Record progress; re-run to resume (one file per bucket) |
 | `--exclude GLOB` | Skip matching keys; repeatable |
 | `--include GLOB` | Restore *only* matching keys; repeatable |
 | `--skip-file PATH` | Read exclude patterns from a file |
@@ -256,6 +257,10 @@ already ruled out.
 - Bulk retrievals typically complete in 5–12 hours; Deep Archive Bulk can take
   up to 48 hours. This tool *initiates* restores — it does not wait for them.
 - `GLACIER_IR` (Instant Retrieval) objects need no restore and are skipped.
+- Objects with a **still-valid** restored copy are skipped rather than
+  re-requested. Once that copy expires they are restored again, so there is no
+  way to *extend* an unexpired window with this tool — copy the data out, or
+  wait for it to lapse.
 
 ---
 
